@@ -47,8 +47,19 @@ enum Command {
     /// container HEALTHCHECK so we don't need to bake a curl/wget into the
     /// runtime image.
     Healthcheck {
-        #[arg(long, default_value = "http://127.0.0.1:9090/health")]
-        url: String,
+        /// Probe target. Defaults to the configured bind (`ERREX_HOST` /
+        /// `ERREX_PORT`) — hard-coding `:9090` here meant any deploy that
+        /// moved the port reported unhealthy forever while serving fine.
+        #[arg(long)]
+        url: Option<String>,
+
+        /// Report unhealthy when the daemon is bound to loopback. Inside a
+        /// container that bind is never serviceable: the published port
+        /// refuses connections while this probe, running on the same
+        /// loopback, would otherwise pass. The image's HEALTHCHECK sets it;
+        /// a host-side probe of a deliberately local daemon should not.
+        #[arg(long, default_value_t = false)]
+        require_public_bind: bool,
     },
 
     /// Manage projects + DSN ingest tokens. Operates directly on the
@@ -108,7 +119,21 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Healthcheck { url }) => return run_healthcheck(&url).await,
+        Some(Command::Healthcheck {
+            url,
+            require_public_bind,
+        }) => {
+            if require_public_bind && cli.config.bind_is_loopback() {
+                anyhow::bail!(
+                    "unhealthy: bound to {} (loopback) — a published container port \
+                     cannot reach it, and this probe runs on the same loopback so it \
+                     cannot see the difference. Set ERREX_HOST=0.0.0.0.",
+                    cli.config.http_host,
+                );
+            }
+            let url = url.unwrap_or_else(|| cli.config.healthcheck_url());
+            return run_healthcheck(&url).await;
+        }
         Some(Command::Project { action }) => return run_project_cmd(action, &cli.config).await,
         None => {}
     }
@@ -194,8 +219,7 @@ async fn main() -> anyhow::Result<()> {
     // payloads will point at `localhost:9090`, which is useless to
     // remote callers. Warn loudly at boot — the operator usually
     // forgot the env var on the first deploy.
-    let bind_host_is_loopback = cfg.http_host == "127.0.0.1" || cfg.http_host == "::1";
-    if cfg.public_url_is_default() && !bind_host_is_loopback {
+    if cfg.public_url_is_default() && !cfg.bind_is_loopback() {
         tracing::warn!(
             bind_host = %cfg.http_host,
             public_url = %cfg.public_url,

@@ -20,10 +20,12 @@ services:
       - errex-data:/data
     environment:
       ERREX_LOG_LEVEL: info
-      # Container-only: bind on all interfaces so the docker port mapping
-      # above can reach the process. The daemon itself defaults to
-      # 127.0.0.1 — it is exposed publicly only because compose explicitly
-      # opts in here.
+      # Bind on all interfaces so the docker port mapping above can reach
+      # the process. The image already sets ERREX_HOST=0.0.0.0 (a loopback
+      # bind is never serviceable in a container); it is repeated here so
+      # the requirement is visible to anyone reading the compose file.
+      # ERREX_MCP_HOST is NOT an image default — the MCP listener is a stub,
+      # so exposing 9092 stays an explicit opt-in.
       ERREX_HOST: 0.0.0.0
       ERREX_MCP_HOST: 0.0.0.0
       # Setup token MUST be supplied by the operator. We deliberately do
