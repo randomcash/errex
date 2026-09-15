@@ -11,11 +11,13 @@ self-host.
 | Variable | Default | What it does |
 |---|---|---|
 | `ERREX_DATA_DIR` | `./data` | SQLite file location |
+| `ERREX_HOST` | `127.0.0.1` | HTTP bind address. **Any container deploy needs `0.0.0.0`** — bound to loopback the process is unreachable through a published port (`-p 9090:9090`), even though the container reports healthy. The official image and `docker-compose.yml` already set it; you only need this when running the binary directly on a host that should accept remote traffic. |
+| `ERREX_MCP_HOST` | `127.0.0.1` | MCP listener bind address. Same container caveat as `ERREX_HOST`, but the MCP listener is a stub — leave it on loopback unless you are actually exposing port 9092. |
 | `ERREX_PORT` | `PORT` env, else `9090` | HTTP + SPA + WebSocket fan-out (single axum listener). Reads `PORT` automatically so Railway / Fly / Render / Heroku one-click deploys "just work". |
 | `ERREX_MCP_PORT` | `9092` | MCP listener (stub) |
 | `ERREX_LOG_LEVEL` | `info` | tracing filter |
 | `ERREX_DEV_MODE` | `false` | Enable CORS for the Vite dev server |
-| `ERREX_REQUIRE_AUTH` | `false` | Validate `sentry_key` on ingest |
+| `ERREX_REQUIRE_AUTH` | `true` | Validate `sentry_key` on ingest. Fail-closed by default; set `false` only when the daemon sits on a trusted network. |
 | `ERREX_RETENTION_DAYS` | `30` | Purge events older than N days; `0` disables |
 | `ERREX_RATE_LIMIT_PER_MIN` | `6000` | Per-project ingest cap; `0` = unlimited |
 | `ERREX_RATE_LIMIT_BURST` | `200` | Token-bucket burst capacity |
