@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -139,6 +139,39 @@ impl Config {
             .expect("valid mcp bind addr")
     }
 
+    /// True when the HTTP listener is bound to a loopback address, in any
+    /// of the spellings an operator might use. Backs both the boot-time
+    /// `ERREX_PUBLIC_URL` warning and `healthcheck --require-public-bind`.
+    pub fn bind_is_loopback(&self) -> bool {
+        match self.http_host.parse::<IpAddr>() {
+            Ok(ip) => ip.is_loopback(),
+            // Not an IP literal: only the well-known name resolves to
+            // loopback in practice. Anything else is a hostname the
+            // operator chose deliberately.
+            Err(_) => self.http_host == "localhost",
+        }
+    }
+
+    /// Probe target for `errexd healthcheck` when `--url` is omitted.
+    /// Derived from the configured bind rather than hard-coded, so a
+    /// deploy that moves the port (or a PaaS that injects `PORT`) does
+    /// not leave the container permanently unhealthy while serving fine.
+    pub fn healthcheck_url(&self) -> String {
+        let host = match self.http_host.as_str() {
+            // Wildcards are bind targets, not connect targets — dial the
+            // matching loopback address instead.
+            "0.0.0.0" => "127.0.0.1".to_string(),
+            "::" => "[::1]".to_string(),
+            host => match host.parse::<IpAddr>() {
+                // Bracket v6 literals or the `host:port` split in
+                // `run_healthcheck` reads the last hextet as the port.
+                Ok(IpAddr::V6(addr)) => format!("[{addr}]"),
+                _ => host.to_string(),
+            },
+        };
+        format!("http://{host}:{}/health", self.resolved_http_port())
+    }
+
     /// Default `public_url` is the local-loopback fallback. Detect it so
     /// `main` can log a warning when the daemon is bound to a public
     /// interface but the operator forgot to set `ERREX_PUBLIC_URL` to
@@ -210,5 +243,57 @@ mod tests {
     fn require_auth_default_is_true() {
         let cfg = Config::parse_from(["errexd"]);
         assert!(cfg.require_auth, "ingest must be auth-gated by default");
+    }
+
+    /// Loopback detection backs both the boot-time `ERREX_PUBLIC_URL`
+    /// warning and the container healthcheck's bind gate, so it has to
+    /// recognise every spelling an operator might reach for — not just
+    /// the literal `127.0.0.1` the old inline check compared against.
+    #[test]
+    fn bind_is_loopback_recognises_every_loopback_spelling() {
+        for host in ["127.0.0.1", "127.0.0.5", "::1", "localhost"] {
+            let cfg = Config::parse_from(["errexd", "--http-host", host]);
+            assert!(cfg.bind_is_loopback(), "{host} should be loopback");
+        }
+        for host in ["0.0.0.0", "::", "192.168.1.10"] {
+            let cfg = Config::parse_from(["errexd", "--http-host", host]);
+            assert!(!cfg.bind_is_loopback(), "{host} should not be loopback");
+        }
+    }
+
+    /// The healthcheck dials the daemon, so a wildcard bind has to be
+    /// rewritten to a concrete loopback address: `0.0.0.0` is a bind
+    /// target, not a connect target.
+    #[test]
+    fn healthcheck_url_normalises_wildcard_binds() {
+        let cfg = Config::parse_from(["errexd", "--http-host", "0.0.0.0"]);
+        assert_eq!(cfg.healthcheck_url(), "http://127.0.0.1:9090/health");
+
+        let cfg = Config::parse_from(["errexd", "--http-host", "::"]);
+        assert_eq!(cfg.healthcheck_url(), "http://[::1]:9090/health");
+    }
+
+    /// IPv6 literals must be bracketed or the `host:port` split in
+    /// `run_healthcheck` parses the last hextet as the port.
+    #[test]
+    fn healthcheck_url_brackets_ipv6_literals() {
+        let cfg = Config::parse_from(["errexd", "--http-host", "::1"]);
+        assert_eq!(cfg.healthcheck_url(), "http://[::1]:9090/health");
+    }
+
+    /// The container HEALTHCHECK used to hard-code `:9090`, so any deploy
+    /// that moved the port (or landed on a PaaS that injects `PORT`) was
+    /// permanently unhealthy while serving fine. The probe target must
+    /// follow the resolved port.
+    #[test]
+    fn healthcheck_url_follows_configured_port() {
+        let cfg = Config::parse_from(["errexd", "--http-port", "8080"]);
+        assert_eq!(cfg.healthcheck_url(), "http://127.0.0.1:8080/health");
+    }
+
+    #[test]
+    fn healthcheck_url_keeps_explicit_host() {
+        let cfg = Config::parse_from(["errexd", "--http-host", "10.0.0.4"]);
+        assert_eq!(cfg.healthcheck_url(), "http://10.0.0.4:9090/health");
     }
 }
