@@ -94,10 +94,19 @@ WORKDIR /home
 # because Railway's Metal builder rejects in-Dockerfile VOLUME directives.
 EXPOSE 9090 9091 9092
 
+# The binary defaults to ERREX_HOST=127.0.0.1 so a bare-metal `errexd` is not
+# reachable off-host until the operator opts in. That default is wrong inside a
+# container: the only way in is a published port, and a loopback bind refuses it
+# while the healthcheck (which probes from inside) still reports healthy. The
+# container boundary is the isolation here, so the image binds all interfaces.
 ENV ERREX_DATA_DIR=/data/store \
+    ERREX_HOST=0.0.0.0 \
     ERREX_LOG_LEVEL=info
 
+# --require-public-bind makes the probe fail when ERREX_HOST is loopback. Without
+# it the check dials 127.0.0.1 from inside the container and passes while the
+# published port is dead — green but unreachable, the worst failure shape.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/errexd", "healthcheck"]
+    CMD ["/usr/local/bin/errexd", "healthcheck", "--require-public-bind"]
 
 ENTRYPOINT ["/usr/local/bin/errexd"]
