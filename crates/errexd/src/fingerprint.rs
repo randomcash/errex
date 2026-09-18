@@ -5,26 +5,66 @@
 //! grouping needs more nuance (module normalization, frame-skip rules,
 //! message templating), and that work belongs in a dedicated module.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-
 use errex_proto::{Event, Fingerprint};
 
+// FNV-1a, 64-bit. Vendored instead of using `DefaultHasher`: the standard
+// library explicitly does not guarantee `DefaultHasher`'s output across
+// compiler versions, but fingerprints are persisted in SQLite across
+// upgrades — a toolchain bump must not silently re-group every issue.
+// FNV-1a needs no crate and no cryptographic strength, just a fixed
+// algorithm we control. Changing this algorithm regroups all existing
+// issues once (there is no fingerprint migration for stored data), so
+// treat the constants and byte layout below as pinned.
+const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+struct Fnv1a(u64);
+
+impl Fnv1a {
+    fn new() -> Self {
+        Self(FNV_OFFSET_BASIS)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    // Tags presence and terminates the field so adjacent fields can't be
+    // confused with each other (e.g. ("ab", "c") vs ("a", "bc")).
+    fn write_opt_str(&mut self, s: Option<&str>) {
+        match s {
+            Some(s) => {
+                self.write(&[1]);
+                self.write(s.as_bytes());
+            }
+            None => self.write(&[0]),
+        }
+        self.write(&[0xff]);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 pub fn derive(event: &Event) -> Fingerprint {
-    let mut h = DefaultHasher::new();
+    let mut h = Fnv1a::new();
 
     if let Some(ex) = event.primary_exception() {
-        ex.ty.hash(&mut h);
+        h.write_opt_str(ex.ty.as_deref());
         if let Some(frame) = ex.first_frame() {
-            frame.function.hash(&mut h);
-            frame.filename.hash(&mut h);
+            h.write_opt_str(frame.function.as_deref());
+            h.write_opt_str(frame.filename.as_deref());
         }
     } else if let Some(msg) = &event.message {
-        msg.hash(&mut h);
+        h.write_opt_str(Some(msg));
     } else {
         // Nothing distinguishing — fall back to event id so each event is its
         // own group rather than collapsing all unknown events together.
-        event.event_id.hash(&mut h);
+        h.write(event.event_id.as_bytes());
     }
 
     Fingerprint::new(format!("{:016x}", h.finish()))
@@ -32,16 +72,12 @@ pub fn derive(event: &Event) -> Fingerprint {
 
 #[cfg(test)]
 mod tests {
-    //! Fingerprint behavior tests. We pin the *contract* (what produces
-    //! equal vs distinct fingerprints) rather than concrete hash values,
-    //! because `DefaultHasher` is intentionally not stable across Rust
-    //! versions — a SHA-256 / blake3 cutover later will change values
-    //! without breaking any of these assertions.
-    //!
-    //! Stability across Rust versions is itself a TODO (see issue tracker):
-    //! once the daemon stores issues persistently across upgrades, the
-    //! fingerprint algorithm must be deterministic across compiler bumps
-    //! or grouping would silently fragment.
+    //! Fingerprint behavior tests. Most tests here pin the *contract* (what
+    //! produces equal vs distinct fingerprints) rather than concrete hash
+    //! values. The `golden_*` tests below additionally pin exact output
+    //! strings for our vendored FNV-1a: unlike `DefaultHasher`, this
+    //! algorithm is ours to keep stable across Rust versions, and these
+    //! tests fail loudly if it ever silently changes.
 
     use super::*;
     use chrono::Utc;
@@ -207,6 +243,50 @@ mod tests {
         let a = derive(&ev_empty());
         let b = derive(&ev_empty());
         assert_ne!(a, b, "two empty events must produce distinct fingerprints");
+    }
+
+    // ----- golden values (pin the algorithm itself, not just the contract) -----
+
+    #[test]
+    fn golden_exception_with_frame() {
+        let fp = derive(&ev_with_exception(
+            "TypeError",
+            "checkout",
+            "src/pay.ts",
+            10,
+        ));
+        assert_eq!(fp.as_str(), "d1337c46f0989069");
+    }
+
+    #[test]
+    fn golden_exception_without_frame() {
+        let event = Event {
+            exception: Some(ExceptionContainer {
+                values: vec![ExceptionInfo {
+                    ty: Some("ReferenceError".into()),
+                    value: None,
+                    module: None,
+                    stacktrace: None,
+                }],
+            }),
+            ..ev_empty()
+        };
+        assert_eq!(derive(&event).as_str(), "adeacf91b32ef0ce");
+    }
+
+    #[test]
+    fn golden_message_only() {
+        let fp = derive(&ev_message("Database connection lost"));
+        assert_eq!(fp.as_str(), "9e2ea9bc10aefce8");
+    }
+
+    #[test]
+    fn golden_event_id_fallback() {
+        let event = Event {
+            event_id: Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap(),
+            ..ev_empty()
+        };
+        assert_eq!(derive(&event).as_str(), "9900bf86b92101a5");
     }
 
     #[test]
