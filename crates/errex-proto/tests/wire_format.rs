@@ -11,9 +11,11 @@
 use chrono::{DateTime, TimeZone, Utc};
 use errex_proto::{
     ClientMessage, Event, ExceptionContainer, ExceptionInfo, Fingerprint, Frame, Issue,
-    IssueStatus, Level, ServerMessage, Stacktrace,
+    IssueStatus, Level, MetricKind, MetricLabels, MetricPoint, ServerMessage, Stacktrace,
+    MAX_METRIC_LABELS,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 fn fixed_ts() -> DateTime<Utc> {
@@ -326,6 +328,180 @@ fn client_message_ping_round_trips() {
     assert_eq!(v.get("type").and_then(|x| x.as_str()), Some("ping"));
     let back: ClientMessage = serde_json::from_value(v).unwrap();
     assert!(matches!(back, ClientMessage::Ping));
+}
+
+// ----- MetricPoint -----
+
+#[test]
+fn metric_kind_serializes_lowercase() {
+    let cases = [
+        (MetricKind::Counter, "counter"),
+        (MetricKind::Gauge, "gauge"),
+        (MetricKind::Histogram, "histogram"),
+    ];
+    for (k, expected) in cases {
+        let v = serde_json::to_value(k).unwrap();
+        assert_eq!(v, Value::String(expected.into()));
+    }
+}
+
+#[test]
+fn metric_kind_rejects_unknown_variant() {
+    let err = serde_json::from_value::<MetricKind>(json!("summary"));
+    assert!(err.is_err());
+}
+
+#[test]
+fn metric_point_round_trips_through_json() {
+    let mut labels = BTreeMap::new();
+    labels.insert("route".to_string(), "/checkout".to_string());
+    labels.insert("method".to_string(), "POST".to_string());
+
+    let point = MetricPoint {
+        name: "http.server.duration".into(),
+        kind: MetricKind::Histogram,
+        value: 42.5,
+        timestamp: fixed_ts(),
+        labels: MetricLabels::try_from(labels.clone()).unwrap(),
+    };
+    let v = serde_json::to_value(&point).unwrap();
+    for name in ["name", "kind", "value", "timestamp", "labels"] {
+        assert!(v.get(name).is_some(), "missing wire field: {name}");
+    }
+    assert_eq!(v.get("kind").and_then(|k| k.as_str()), Some("histogram"));
+    assert_eq!(v.get("labels"), Some(&json!(labels)));
+
+    let round: MetricPoint = serde_json::from_value(v).unwrap();
+    assert_eq!(round.name, "http.server.duration");
+    assert_eq!(round.kind, MetricKind::Histogram);
+    assert_eq!(round.value, 42.5);
+    assert_eq!(round.labels.len(), 2);
+}
+
+#[test]
+fn metric_point_labels_default_to_empty_when_missing() {
+    let raw = json!({
+        "name": "queue.depth",
+        "kind": "gauge",
+        "value": 3.0,
+        "timestamp": "2026-01-02T03:04:05Z",
+    });
+    let point: MetricPoint = serde_json::from_value(raw).expect("labels must be optional");
+    assert!(point.labels.is_empty());
+}
+
+#[test]
+fn metric_point_rejects_missing_name() {
+    let raw = json!({
+        "kind": "counter",
+        "value": 1.0,
+        "timestamp": "2026-01-02T03:04:05Z",
+    });
+    assert!(serde_json::from_value::<MetricPoint>(raw).is_err());
+}
+
+#[test]
+fn metric_point_rejects_missing_kind() {
+    let raw = json!({
+        "name": "requests_total",
+        "value": 1.0,
+        "timestamp": "2026-01-02T03:04:05Z",
+    });
+    assert!(serde_json::from_value::<MetricPoint>(raw).is_err());
+}
+
+#[test]
+fn metric_point_rejects_missing_value() {
+    let raw = json!({
+        "name": "requests_total",
+        "kind": "counter",
+        "timestamp": "2026-01-02T03:04:05Z",
+    });
+    assert!(serde_json::from_value::<MetricPoint>(raw).is_err());
+}
+
+#[test]
+fn metric_point_rejects_missing_timestamp() {
+    let raw = json!({
+        "name": "requests_total",
+        "kind": "counter",
+        "value": 1.0,
+    });
+    assert!(serde_json::from_value::<MetricPoint>(raw).is_err());
+}
+
+#[test]
+fn metric_point_rejects_non_numeric_value() {
+    let raw = json!({
+        "name": "requests_total",
+        "kind": "counter",
+        "value": "not-a-number",
+        "timestamp": "2026-01-02T03:04:05Z",
+    });
+    assert!(serde_json::from_value::<MetricPoint>(raw).is_err());
+}
+
+#[test]
+fn metric_point_rejects_malformed_timestamp() {
+    let raw = json!({
+        "name": "requests_total",
+        "kind": "counter",
+        "value": 1.0,
+        "timestamp": "not-a-timestamp",
+    });
+    assert!(serde_json::from_value::<MetricPoint>(raw).is_err());
+}
+
+#[test]
+fn metric_labels_accepts_at_cap() {
+    let mut labels = BTreeMap::new();
+    for i in 0..MAX_METRIC_LABELS {
+        labels.insert(format!("key{i}"), format!("value{i}"));
+    }
+    assert!(MetricLabels::try_from(labels).is_ok());
+}
+
+#[test]
+fn metric_labels_rejects_over_cap() {
+    let mut labels = BTreeMap::new();
+    for i in 0..=MAX_METRIC_LABELS {
+        labels.insert(format!("key{i}"), format!("value{i}"));
+    }
+    assert!(MetricLabels::try_from(labels).is_err());
+}
+
+#[test]
+fn metric_point_deserialize_rejects_over_cap_labels() {
+    let mut labels = serde_json::Map::new();
+    for i in 0..=MAX_METRIC_LABELS {
+        labels.insert(format!("key{i}"), json!(format!("value{i}")));
+    }
+    let raw = json!({
+        "name": "requests_total",
+        "kind": "counter",
+        "value": 1.0,
+        "timestamp": "2026-01-02T03:04:05Z",
+        "labels": labels,
+    });
+    let err = serde_json::from_value::<MetricPoint>(raw).expect_err("over-cap labels must fail");
+    assert!(err.to_string().contains("labels"));
+}
+
+#[test]
+fn metric_point_deserialize_accepts_at_cap_labels() {
+    let mut labels = serde_json::Map::new();
+    for i in 0..MAX_METRIC_LABELS {
+        labels.insert(format!("key{i}"), json!(format!("value{i}")));
+    }
+    let raw = json!({
+        "name": "requests_total",
+        "kind": "counter",
+        "value": 1.0,
+        "timestamp": "2026-01-02T03:04:05Z",
+        "labels": labels,
+    });
+    let point: MetricPoint = serde_json::from_value(raw).expect("at-cap labels must be accepted");
+    assert_eq!(point.labels.len(), MAX_METRIC_LABELS);
 }
 
 // Anchor that makes Uuid + Stacktrace + ExceptionContainer "used" if
