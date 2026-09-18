@@ -6,10 +6,12 @@ pub mod error;
 pub mod event;
 pub mod fingerprint;
 pub mod issue;
+pub mod metric;
 pub mod wire;
 
 pub use error::ProtoError;
 pub use event::{Event, ExceptionContainer, ExceptionInfo, Frame, Level, Stacktrace};
 pub use fingerprint::Fingerprint;
 pub use issue::{Issue, IssueStatus};
+pub use metric::{MetricKind, MetricLabels, MetricPoint, MAX_METRIC_LABELS};
 pub use wire::{ClientMessage, ServerMessage};
