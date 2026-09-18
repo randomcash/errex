@@ -490,10 +490,21 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn unique_tempdir() -> PathBuf {
+        // The nanosecond timestamp alone is not a reliable discriminator:
+        // under the parallel test harness several threads can be released
+        // from scheduling at wall-clock instants that collapse to the same
+        // reported nanosecond, so two tests would land on the same dir and
+        // share one SQLite file underneath their (supposedly independent)
+        // `Store`s. A process-wide counter is monotonic regardless of clock
+        // resolution, so pair it with the timestamp instead of trusting the
+        // clock alone.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
-            "errexd-webhook-{}-{}",
+            "errexd-webhook-{}-{}-{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            n
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
@@ -543,6 +554,37 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         None
+    }
+
+    /// Reproduces the cross-test race directly: release a batch of threads
+    /// from a barrier at the same instant and call `unique_tempdir()` from
+    /// each. Before the fix this reliably produced duplicate paths (a
+    /// nanosecond timestamp is not unique across threads woken from the same
+    /// barrier), which meant two `#[tokio::test]` webhook tests running in
+    /// parallel could open the same underlying SQLite file and observe each
+    /// other's `last_webhook_status` writes on the shared "p" project row —
+    /// exactly the "a different test fails each run" symptom.
+    #[test]
+    fn unique_tempdir_is_unique_under_thread_contention() {
+        use std::collections::HashSet;
+        use std::sync::Barrier;
+
+        let n = 32;
+        let barrier = Arc::new(Barrier::new(n));
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                unique_tempdir()
+            }));
+        }
+        let paths: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let set: HashSet<_> = paths.iter().collect();
+        assert_eq!(paths.len(), set.len(), "collision: {:?}", paths);
+        for p in &paths {
+            let _ = std::fs::remove_dir_all(p);
+        }
     }
 
     #[tokio::test]
