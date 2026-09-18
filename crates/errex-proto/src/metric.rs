@@ -99,8 +99,11 @@ impl<'de> Deserialize<'de> for MetricLabels {
 ///
 /// - OTLP nests points under
 ///   `resourceMetrics[].scopeMetrics[].metrics[].{gauge,sum,histogram}.dataPoints[]`;
-///   this flattens to one point per struct, with `kind` carrying what OTLP
-///   encodes as the oneof wrapper field name.
+///   this flattens to one point per struct, with `kind` standing in for the
+///   oneof wrapper. The names are not identical: OTLP's wrapper keys are
+///   `gauge`, `sum` and `histogram`, so an ingest layer reading OTLP/JSON
+///   must map `sum` (monotonic, cumulative) onto [`MetricKind::Counter`].
+///   `gauge` and `histogram` match by name.
 /// - OTLP encodes `timeUnixNano` as a decimal string, since JSON numbers
 ///   cannot losslessly hold a 64-bit nanosecond timestamp. We use
 ///   `DateTime<Utc>` for consistency with [`crate::event::Event::timestamp`];
