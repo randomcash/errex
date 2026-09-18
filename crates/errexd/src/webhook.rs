@@ -556,14 +556,23 @@ mod tests {
         None
     }
 
-    /// Reproduces the cross-test race directly: release a batch of threads
-    /// from a barrier at the same instant and call `unique_tempdir()` from
-    /// each. Before the fix this reliably produced duplicate paths (a
-    /// nanosecond timestamp is not unique across threads woken from the same
-    /// barrier), which meant two `#[tokio::test]` webhook tests running in
-    /// parallel could open the same underlying SQLite file and observe each
-    /// other's `last_webhook_status` writes on the shared "p" project row —
-    /// exactly the "a different test fails each run" symptom.
+    /// Pins the property the fix provides: `unique_tempdir()` returns
+    /// distinct paths even when called from many threads at the same instant.
+    /// Release a batch of threads from a barrier and check for collisions.
+    /// Without the counter this fails every time — a nanosecond timestamp is
+    /// not unique across threads woken together.
+    ///
+    /// Scope, stated honestly: this proves the *collision*, not the corruption
+    /// downstream of it. It does not open a `Store`, and it does not run two
+    /// `#[tokio::test]`s concurrently to watch one clobber the other's
+    /// `last_webhook_status`. The link between the two — colliding paths mean
+    /// a shared SQLite file, which means a shared "p" project row — is
+    /// reasoning, not something this test demonstrates.
+    ///
+    /// The evidence that it was the operative cause is the suite itself:
+    /// `cargo test --workspace` failed roughly one run in two before, and ran
+    /// clean 8 times in a row after. That measurement lives in the PR, because
+    /// it is not something a unit test can assert.
     #[test]
     fn unique_tempdir_is_unique_under_thread_contention() {
         use std::collections::HashSet;
