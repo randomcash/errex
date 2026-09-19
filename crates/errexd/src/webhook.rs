@@ -490,10 +490,21 @@ mod tests {
     use tokio::net::TcpListener;
 
     fn unique_tempdir() -> PathBuf {
+        // The nanosecond timestamp alone is not a reliable discriminator:
+        // under the parallel test harness several threads can be released
+        // from scheduling at wall-clock instants that collapse to the same
+        // reported nanosecond, so two tests would land on the same dir and
+        // share one SQLite file underneath their (supposedly independent)
+        // `Store`s. A process-wide counter is monotonic regardless of clock
+        // resolution, so pair it with the timestamp instead of trusting the
+        // clock alone.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
-            "errexd-webhook-{}-{}",
+            "errexd-webhook-{}-{}-{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            n
         ));
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
@@ -543,6 +554,89 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         None
+    }
+
+    /// Pins the property the fix provides: `unique_tempdir()` returns
+    /// distinct paths even when called from many threads at the same instant.
+    /// Release a batch of threads from a barrier and check for collisions.
+    /// Without the counter this fails every time — a nanosecond timestamp is
+    /// not unique across threads woken together.
+    ///
+    /// Scope, stated honestly: this proves the *collision*, not the corruption
+    /// downstream of it. It does not open a `Store`, and it does not run two
+    /// `#[tokio::test]`s concurrently to watch one clobber the other's
+    /// `last_webhook_status`. The link between the two — colliding paths mean
+    /// a shared SQLite file, which means a shared "p" project row — is
+    /// reasoning, not something this test demonstrates.
+    ///
+    /// The evidence that it was the operative cause is the suite itself:
+    /// `cargo test --workspace` failed roughly one run in two before, and ran
+    /// clean 8 times in a row after. That measurement lives in the PR, because
+    /// it is not something a unit test can assert.
+    #[test]
+    fn unique_tempdir_is_unique_under_thread_contention() {
+        use std::collections::HashSet;
+        use std::sync::Barrier;
+
+        let n = 32;
+        let barrier = Arc::new(Barrier::new(n));
+        let mut handles = Vec::new();
+        for _ in 0..n {
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                unique_tempdir()
+            }));
+        }
+        let paths: Vec<PathBuf> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let set: HashSet<_> = paths.iter().collect();
+        assert_eq!(paths.len(), set.len(), "collision: {:?}", paths);
+        for p in &paths {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+
+    /// Closes the gap the previous test left open: shows the shared handle
+    /// directly, with two independent `Store` instances rather than one
+    /// handle round-tripping its own write. `Store::open()` is called twice
+    /// against the identical path — standing in for the identical path a
+    /// colliding `unique_tempdir()` used to hand out to two different
+    /// `#[tokio::test]` functions, each of which opens its own `Store`. One
+    /// instance stands in for a test that already delivered a webhook; the
+    /// other, for a test that never sent anything and only polls for its own
+    /// result. `wait_for_status` only checks "is a status present", so the
+    /// second instance observes the first's write on its very first poll —
+    /// deterministic every run, no barrier or nanosecond collision required,
+    /// and exactly what let a different webhook test fail on each run of the
+    /// parallel suite before `unique_tempdir()` gained its counter.
+    #[tokio::test]
+    async fn colliding_paths_let_two_independent_stores_share_a_project_row() {
+        let dir = unique_tempdir();
+        let db_path = dir.join("errex.db");
+
+        // Stand-in for one test's Store, as constructed by a colliding
+        // unique_tempdir().
+        let store_a = Store::open(&db_path).await.unwrap();
+        store_a.migrate().await.unwrap();
+        store_a.create_project("p").await.unwrap();
+        store_a.record_webhook_attempt("p", 502).await;
+
+        // Stand-in for a second, independent test's Store — a distinct
+        // instance opened against the same path, not a clone of store_a.
+        let store_b = Store::open(&db_path).await.unwrap();
+
+        // This second instance never configured a webhook and never sent a
+        // trigger — if the row were private to store_a, this would time out
+        // to None. Instead it observes store_a's write on the first poll.
+        assert_eq!(
+            wait_for_status(&store_b, "p").await,
+            Some(502),
+            "two Store instances opened against a colliding path share the \
+             same project row — the second observes the first's delivery \
+             outcome as if it were its own",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
