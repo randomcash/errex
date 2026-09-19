@@ -597,36 +597,43 @@ mod tests {
     }
 
     /// Closes the gap the previous test left open: shows the shared handle
-    /// directly rather than only reasoning about it. Two tests colliding on
-    /// `unique_tempdir()` would open the identical SQLite file and share the
-    /// "p" project row — this test hands `wait_for_status` exactly that
-    /// situation without any timing games. It writes a status as a stand-in
-    /// for "another test's Store landed here first", then polls a project
-    /// this test never delivered anything to. `wait_for_status` only checks
-    /// "is a status present", so the foreign write satisfies it on the very
-    /// first poll — deterministic every run, no barrier or nanosecond
-    /// collision required, and it is exactly what let a different webhook
-    /// test fail on each run of the parallel suite before `unique_tempdir()`
-    /// gained its counter.
+    /// directly, with two independent `Store` instances rather than one
+    /// handle round-tripping its own write. `Store::open()` is called twice
+    /// against the identical path — standing in for the identical path a
+    /// colliding `unique_tempdir()` used to hand out to two different
+    /// `#[tokio::test]` functions, each of which opens its own `Store`. One
+    /// instance stands in for a test that already delivered a webhook; the
+    /// other, for a test that never sent anything and only polls for its own
+    /// result. `wait_for_status` only checks "is a status present", so the
+    /// second instance observes the first's write on its very first poll —
+    /// deterministic every run, no barrier or nanosecond collision required,
+    /// and exactly what let a different webhook test fail on each run of the
+    /// parallel suite before `unique_tempdir()` gained its counter.
     #[tokio::test]
-    async fn shared_store_row_lets_a_foreign_write_masquerade_as_this_tests_result() {
+    async fn colliding_paths_let_two_independent_stores_share_a_project_row() {
         let dir = unique_tempdir();
-        let store = Store::open(&dir.join("errex.db")).await.unwrap();
-        store.migrate().await.unwrap();
-        store.create_project("p").await.unwrap();
+        let db_path = dir.join("errex.db");
 
-        // Stand-in for a second test's Store colliding on this same file and
-        // row, as a nanosecond-only unique_tempdir() used to allow.
-        store.record_webhook_attempt("p", 502).await;
+        // Stand-in for one test's Store, as constructed by a colliding
+        // unique_tempdir().
+        let store_a = Store::open(&db_path).await.unwrap();
+        store_a.migrate().await.unwrap();
+        store_a.create_project("p").await.unwrap();
+        store_a.record_webhook_attempt("p", 502).await;
 
-        // This test never configured a webhook and never sent a trigger — if
-        // the row were private, wait_for_status would time out to None.
+        // Stand-in for a second, independent test's Store — a distinct
+        // instance opened against the same path, not a clone of store_a.
+        let store_b = Store::open(&db_path).await.unwrap();
+
+        // This second instance never configured a webhook and never sent a
+        // trigger — if the row were private to store_a, this would time out
+        // to None. Instead it observes store_a's write on the first poll.
         assert_eq!(
-            wait_for_status(&store, "p").await,
+            wait_for_status(&store_b, "p").await,
             Some(502),
-            "a write from a Store sharing this row masquerades as this test's \
-             own delivery outcome before it has run anything — the corruption \
-             a colliding unique_tempdir() would produce",
+            "two Store instances opened against a colliding path share the \
+             same project row — the second observes the first's delivery \
+             outcome as if it were its own",
         );
 
         let _ = std::fs::remove_dir_all(&dir);
